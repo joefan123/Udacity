@@ -85,6 +85,12 @@
 #include <stdio.h>
 #include <cmath>
 
+
+// --------------------------------------------------------------------------------
+// Debug output
+// --------------------------------------------------------------------------------
+
+
 __global__ 
 void dummy1(const float * const d_in)
 {
@@ -122,21 +128,28 @@ void dummy3(const unsigned int * const pHistogram)
 }
 
 
+// --------------------------------------------------------------------------------
+// GPU kernels
+// --------------------------------------------------------------------------------
+
 
 __global__ 
-void global_CalcMinMax1_kernel(const float * const d_logLuminance,
+void global_CalcMinMax1_kernel(const float * const d_pArrLogLuminance,
                                const int pBlockSize,
                                float * pMin,
                                float * pMax)
 {
 
     // Declarations
-    float vMin, vMax;
+    float vMin;
+    float vMax;
     int vPixelID;
     int vCount1;
 
+    // Debug
     // printf("blockIdx.x = %d\n", blockIdx.x);
     // printf("blockDim.x = %d\n", blockDim.x);
+
     // Initialize
     vMin = +99.0;
     vMax = -99.0;
@@ -144,72 +157,49 @@ void global_CalcMinMax1_kernel(const float * const d_logLuminance,
 
     for (vCount1 = 0; vCount1 < pBlockSize ; vCount1++)
     {
-        vMin = fmin(d_logLuminance[vPixelID + vCount1], vMin);
-        vMax = fmax(d_logLuminance[vPixelID + vCount1], vMax);
+        vMin = fmin(d_pArrLogLuminance[vPixelID + vCount1], vMin);
+        vMax = fmax(d_pArrLogLuminance[vPixelID + vCount1], vMax);
     }
     pMin[blockIdx.x] = vMin;
     pMax[blockIdx.x] = vMax;
 }
 
 __global__ 
-void global_CalcMinMax2_kernel(float * const d_intermediate_min,
-                               float * const d_intermediate_max,
+void global_CalcMinMax2_kernel(float * const d_pArrIntermediate_min,
+                               float * const d_pArrIntermediate_max,
                                const int pBlocks)
 {
     // Declarations
-    float vMin, vMax;
+    float vMin;
+    float vMax;
     int vCount1;
 
     vMin = +99.0;
     vMax = -99.0;
     for (vCount1 = 0; vCount1 < pBlocks ; vCount1++)
     {
-        vMin = fmin(d_intermediate_min[vCount1], vMin);
-        vMax = fmax(d_intermediate_max[vCount1], vMax);
+        vMin = fmin(d_pArrIntermediate_min[vCount1], vMin);
+        vMax = fmax(d_pArrIntermediate_max[vCount1], vMax);
     }
-    d_intermediate_min[0] = vMin;
-    d_intermediate_max[0] = vMax;
+    d_pArrIntermediate_min[0] = vMin;
+    d_pArrIntermediate_max[0] = vMax;
 }
 
 __global__
-void global_InitHist_kernel(unsigned int * const pHistogram,
-                            int const pNumRows,
-                            int const pNumCols,
-                            int const pNumBin)
+void global_InitHist_kernel(unsigned int * const pArrHistogram)
 {
-    // Declarations
-    int vBinID;
-    float vRange;
-    int vIdxRow;
-    int vIdxCol;
-    int vIdxPixel;
-
-    // Initialize pixel location
-    vIdxCol = (blockIdx.x * blockDim.x) + threadIdx.x;
-    vIdxRow = (blockIdx.y * blockDim.y) + threadIdx.y;
-    vIdxPixel = vIdxRow * pNumCols + vIdxCol;
-
-
-    // Check image bounds before accessing GPU memory
-    if ( vIdxCol >= pNumCols || vIdxRow >= pNumRows )
-    {
-        return;
-    }
-
     // Initialize histogram
-    pHistogram[vIdxPixel] = 0;
-
+    pArrHistogram[threadIdx.x] = 0;
 }
 
 __global__ 
-void global_CalcHist_kernel(const float * const d_logLuminance,
-                            int const pNumRows,
-                            int const pNumCols,
-                            int const pNumBins,
-                            float const pMin_logLum,
-                            float const pMax_logLum,
-                            unsigned int * pHistogram)
-
+void global_CalcHistOld_kernel(const float * const d_pArrLogLuminance,
+                                  int const pNumRows,
+                                  int const pNumCols,
+                                  int const pNumBins,
+                                  float const pMin_logLum,
+                                  float const pMax_logLum,
+                                  unsigned int * pArrHistogram)
 {
 
     // Declarations
@@ -226,23 +216,116 @@ void global_CalcHist_kernel(const float * const d_logLuminance,
 
     // Check image bounds before accessing GPU memory
     if ( vIdxCol >= pNumCols || vIdxRow >= pNumRows )
-    {
         return;
-    }
 
     // Identify bins
     vRange = pMax_logLum - pMin_logLum;
     vBinID = min(static_cast<unsigned int>(pNumBins - 1),
-                 static_cast<unsigned int>((d_logLuminance[vIdxPixel] - pMin_logLum) / vRange * pNumBins));
+                 static_cast<unsigned int>((d_pArrLogLuminance[vIdxPixel] - pMin_logLum) / vRange * pNumBins));
 
+    // Debug output
     // printf("vIdxCol = %d, vIdxRow = %d, vIdxPixel = %d, vBinID = %d\n", vIdxCol, vIdxRow, vIdxPixel, vBinID);
 
     // Increment histogram
-    atomicAdd(& pHistogram[vBinID], 1);
+    atomicAdd(&(pArrHistogram[vBinID]), 1);
 
 }
 
-void CalcMinMax(const float * const d_logLuminance,
+
+__global__ 
+void global_CalcHistReduce_kernel(const float * const d_pArrLogLuminance,
+                                  int const pNumRows,
+                                  int const pNumCols,
+                                  int const pNumBins,
+                                  float const pMin_logLum,
+                                  float const pMax_logLum,
+                                  unsigned int * pArrHistogram)
+{
+    // Declarations
+    int vBinID;
+    float vRange;
+    int vIdxPixel;
+
+    // Allocate memory for thread block's histogram
+    extern __shared__ unsigned int sh_vArrHistogram[];
+
+    // Initialize thread block's histogram
+    vBinID = threadIdx.x;  
+    sh_vArrHistogram[vBinID] = 0;
+
+    __syncthreads();    // ensure that initialization is complete
+
+    // Initialize pixel location
+    vIdxPixel = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+    if (vIdxPixel > pNumRows * pNumCols)
+        return;
+
+    // Identify bins
+    vRange = pMax_logLum - pMin_logLum;
+    vBinID = min(static_cast<unsigned int>(pNumBins - 1),
+                 static_cast<unsigned int>((d_pArrLogLuminance[vIdxPixel] - pMin_logLum) / vRange * pNumBins));
+
+    // Increment thread block's histogram
+    atomicAdd(&sh_vArrHistogram[vBinID], 1);
+
+    __syncthreads();    // ensure that all thread block histograms are complete
+
+    // Consolidate all thread block histograms into final histogram
+    vBinID = threadIdx.x;
+    atomicAdd(&pArrHistogram[vBinID], sh_vArrHistogram[vBinID]);
+
+}
+
+
+__global__ 
+void global_CalcHistNew_kernel(const float * const d_pArrLogLuminance,
+                                  int const pNumRows,
+                                  int const pNumCols,
+                                  int const pNumBins,
+                                  float const pMin_logLum,
+                                  float const pMax_logLum,
+                                  unsigned int * pArrHistogram)
+{
+
+    // Declarations
+    int vBinID;
+    float vRange;
+    int vIdxRow;
+    int vIdxCol;
+    int vIdxPixel;
+
+    // Initialize pixel location
+    vIdxCol = (blockIdx.x * blockDim.x) + threadIdx.x;
+    vIdxRow = (blockIdx.y * blockDim.y) + threadIdx.y;
+    vIdxPixel = vIdxRow * pNumCols + vIdxCol;
+
+    // Check image bounds before accessing GPU memory
+    if ( vIdxCol >= pNumCols || vIdxRow >= pNumRows )
+        return;
+
+    // Identify bins
+    vRange = pMax_logLum - pMin_logLum;
+    vBinID = min(static_cast<unsigned int>(pNumBins - 1),
+                 static_cast<unsigned int>((d_pArrLogLuminance[vIdxPixel] - pMin_logLum) / vRange * pNumBins));
+
+    // Debug output
+    // printf("vIdxCol = %d, vIdxRow = %d, vIdxPixel = %d, vBinID = %d\n", vIdxCol, vIdxRow, vIdxPixel, vBinID);
+
+    // Increment histogram
+    atomicAdd(&(pArrHistogram[vBinID]), 1);
+
+}
+
+
+
+
+
+// --------------------------------------------------------------------------------
+// Subroutine functions
+// --------------------------------------------------------------------------------
+
+void CalcMinMax(const float * const d_pArrLogLuminance,
                 int const pNumRows,
                 int const pNumCols,
                 float &pMin_logLum,
@@ -255,12 +338,12 @@ void CalcMinMax(const float * const d_logLuminance,
     // Declarations
     int vBlocks;
     int vBlockSize;
-    float *d_intermediate_min;
-    float *d_intermediate_max;
+    float *d_vArrIntermediate_min;
+    float *d_vArrIntermediate_max;
 
     // Allocate memory
-    checkCudaErrors(cudaMalloc(&d_intermediate_min, sizeof(float) * pNumRows * pNumCols));
-    checkCudaErrors(cudaMalloc(&d_intermediate_max, sizeof(float) * pNumRows * pNumCols));
+    checkCudaErrors(cudaMalloc(&d_vArrIntermediate_min, sizeof(float) * pNumRows * pNumCols));
+    checkCudaErrors(cudaMalloc(&d_vArrIntermediate_max, sizeof(float) * pNumRows * pNumCols));
 
     // Initalization
     vBlockSize = 16 * 16;
@@ -268,87 +351,249 @@ void CalcMinMax(const float * const d_logLuminance,
 
     // Calc min and max for sections in the picture
     global_CalcMinMax1_kernel<<<vBlocks, 1>>>
-        (d_logLuminance,
+        (d_pArrLogLuminance,
          vBlockSize,
-         d_intermediate_min,
-         d_intermediate_max);
+         d_vArrIntermediate_min,
+         d_vArrIntermediate_max);
 
     cudaDeviceSynchronize();
     checkCudaErrors(cudaGetLastError());
     
     // debug 1
-    dummy2<<<1, 1>>>(d_intermediate_min);
-    dummy2<<<1, 1>>>(d_intermediate_max);
+    dummy2<<<1, 1>>>(d_vArrIntermediate_min);
+    dummy2<<<1, 1>>>(d_vArrIntermediate_max);
     
     // Consolidate min and max values
     global_CalcMinMax2_kernel<<<1,1>>>
-        (d_intermediate_min,
-         d_intermediate_max,
+        (d_vArrIntermediate_min,
+         d_vArrIntermediate_max,
          vBlocks);
 
     cudaDeviceSynchronize();
     checkCudaErrors(cudaGetLastError());
 
-    checkCudaErrors(cudaMemcpy(&pMin_logLum, d_intermediate_min, sizeof(float), cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaMemcpy(&pMax_logLum, d_intermediate_max, sizeof(float), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(&pMin_logLum, d_vArrIntermediate_min, sizeof(float), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(&pMax_logLum, d_vArrIntermediate_max, sizeof(float), cudaMemcpyDeviceToHost));
 
     // debug 2
     printf ("pMin_logLum=%f\n", pMin_logLum);
     printf ("pMax_logLum=%f\n", pMax_logLum);
     
     // Free GPU memory allocation
-    checkCudaErrors(cudaFree(d_intermediate_min));
-    checkCudaErrors(cudaFree(d_intermediate_max));
+    checkCudaErrors(cudaFree(d_vArrIntermediate_min));
+    checkCudaErrors(cudaFree(d_vArrIntermediate_max));
 
 }
 
-void CalcHistogram(const float * const d_logLuminance,
+void CalcHistogramOld(const float * const d_pArrLogLuminance,
                    int const pNumRows,
                    int const pNumCols,
                    int const pNumBins,
                    float const pMin_logLum,
                    float const pMax_logLum,
-                   unsigned int * pHistogram)
+                   unsigned int * pArrHistogram)
 {
     // Initalization
-    const dim3 vBlockSize(16, 16, 1);
+    // const dim3 vBlockSize(16, 16, 1);
+    const dim3 vBlockSize(32, 32, 1);
 
     const dim3 vGridSize(ceil(static_cast<float>(pNumCols) / vBlockSize.x), 
                          ceil(static_cast<float>(pNumRows) / vBlockSize.y),
                          1);
 
     // Initialize histogram
-    global_InitHist_kernel<<<vGridSize, vBlockSize>>>
-        (pHistogram,
-         pNumRows,
-         pNumCols,
-         pNumBins);
+    global_InitHist_kernel<<<1, pNumBins>>>
+        (pArrHistogram);
 
     cudaDeviceSynchronize();
     checkCudaErrors(cudaGetLastError());
-
+    
     // Generate histogram
-    global_CalcHist_kernel<<<vGridSize, vBlockSize>>>
-        (d_logLuminance,
+    global_CalcHistOld_kernel<<<vGridSize, vBlockSize>>>
+        (d_pArrLogLuminance,
          pNumRows,
          pNumCols,
          pNumBins,
          pMin_logLum,
          pMax_logLum,
-         pHistogram);
+         pArrHistogram);
     
     cudaDeviceSynchronize();
     checkCudaErrors(cudaGetLastError());
   
     // debug
-    dummy3<<<1, 1>>>(pHistogram);
+    dummy3<<<1, 1>>>(pArrHistogram);
+    checkCudaErrors(cudaGetLastError());
+
+}
+
+void CalcHistogramReduce(const float * const d_pArrLogLuminance,
+                         int const pNumRows,
+                         int const pNumCols,
+                         int const pNumBins,
+                         float const pMin_logLum,
+                         float const pMax_logLum,
+                         unsigned int * pArrHistogram)
+{
+
+    // Initalization
+    const int vBlockSize = pNumBins;
+    const int vGridSize = ceil(static_cast<float>(pNumRows * pNumCols) / pNumBins);
+
+    // Initialize histogram
+    global_InitHist_kernel<<<1, pNumBins>>>
+        (pArrHistogram);
+
+    cudaDeviceSynchronize();
+    checkCudaErrors(cudaGetLastError());
+    
+    // Generate histogram
+    global_CalcHistReduce_kernel<<<vGridSize, vBlockSize, pNumBins * sizeof(unsigned int)>>>
+        (d_pArrLogLuminance,
+         pNumRows,
+         pNumCols,
+         pNumBins,
+         pMin_logLum,
+         pMax_logLum,
+         pArrHistogram);
+    
+    cudaDeviceSynchronize();
+    checkCudaErrors(cudaGetLastError());
+
+    // debug
+    dummy3<<<1, 1>>>(pArrHistogram);
     checkCudaErrors(cudaGetLastError());
 
 }
 
 
-void your_histogram_and_prefixsum(const float* const d_logLuminance,
-                                  unsigned int* const d_cdf,
+void CalcHistogramNew(const float * const d_pArrLogLuminance,
+                         int const pNumRows,
+                         int const pNumCols,
+                         int const pNumBins,
+                         float const pMin_logLum,
+                         float const pMax_logLum,
+                         unsigned int * pArrHistogram)
+{
+    printf("Work in progress\n");
+    /*
+    // Initalization
+    // const dim3 vBlockSize(16, 16, 1);
+    const dim3 vBlockSize(32, 32, 1);
+
+    const dim3 vGridSize(ceil(static_cast<float>(pNumCols) / vBlockSize.x), 
+                         ceil(static_cast<float>(pNumRows) / vBlockSize.y),
+                         1);
+
+    // Initialize histogram
+    global_InitHist_kernel<<<1, pNumBins>>>
+        (pArrHistogram);
+
+    cudaDeviceSynchronize();
+    checkCudaErrors(cudaGetLastError());
+    
+    // Generate histogram
+    global_CalcHistNew_kernel<<<vGridSize, vBlockSize>>>
+        (d_pArrLogLuminance,
+         pNumRows,
+         pNumCols,
+         pNumBins,
+         pMin_logLum,
+         pMax_logLum,
+         pArrHistogram);
+    
+    cudaDeviceSynchronize();
+    checkCudaErrors(cudaGetLastError());
+  
+    // debug
+    dummy3<<<1, 1>>>(pArrHistogram);
+    checkCudaErrors(cudaGetLastError());
+    */
+}
+
+
+void CalcCDF(const unsigned int * const pArrHistogram,
+             const int pNumBins,
+             unsigned int * const d_pArrCDF)
+{
+
+    
+
+}
+
+void ShowDeviceProperty()
+{
+
+    // Declarations
+    cudaDeviceProp deviceProperty;
+    int totalCudaCores;
+
+    // Initialize cuda properties
+    checkCudaErrors( cudaGetDeviceProperties( &deviceProperty, 0 ) );
+
+    // Show CUDA properties
+    printf("device name                = %s\n" , deviceProperty.name);
+    printf("device sharedMemPerBlock   = %d\n" , deviceProperty.sharedMemPerBlock);
+    printf("device totalGlobalMem      = %d\n" , deviceProperty.totalGlobalMem);
+    printf("device regsPerBlock        = %d\n" , deviceProperty.regsPerBlock);
+    printf("device warpSize            = %d\n" , deviceProperty.warpSize);
+    printf("device memPitch            = %d\n" , deviceProperty.memPitch);
+    printf("device maxThreadsPerBlock  = %d\n" , deviceProperty.maxThreadsPerBlock);
+    printf("device maxThreadsDim[0]    = %d\n" , deviceProperty.maxThreadsDim[0]);
+    printf("device maxThreadsDim[1]    = %d\n" , deviceProperty.maxThreadsDim[1]);
+    printf("device maxThreadsDim[2]    = %d\n" , deviceProperty.maxThreadsDim[2]);
+    printf("device maxGridSize[0]      = %d\n" , deviceProperty.maxGridSize[0]);
+    printf("device maxGridSize[1]      = %d\n" , deviceProperty.maxGridSize[1]);
+    printf("device maxGridSize[2]      = %d\n" , deviceProperty.maxGridSize[2]);
+    printf("device totalConstMem       = %d\n" , deviceProperty.totalConstMem);
+    printf("device major               = %d\n" , deviceProperty.major);
+    printf("device minor               = %d\n" , deviceProperty.minor);
+    printf("device clockRate           = %d\n" , deviceProperty.clockRate);
+    printf("device textureAlignment    = %d\n" , deviceProperty.textureAlignment);
+    printf("device deviceOverlap       = %d\n" , deviceProperty.deviceOverlap);
+    printf("device multiProcessorCount = %d\n" , deviceProperty.multiProcessorCount);
+    
+    // Show total cores
+    if (deviceProperty.major == 1)
+    {
+        totalCudaCores = (deviceProperty.multiProcessorCount*8);
+        printf("Total CUDA cores: %d \n", totalCudaCores);
+    }
+    else if (deviceProperty.major == 2)
+    {
+        if (deviceProperty.minor == 0)
+        {
+            totalCudaCores = (deviceProperty.multiProcessorCount*32);
+            printf("Total CUDA cores: %d \n", totalCudaCores);
+        }
+        else if (deviceProperty.minor == 1)
+        {
+            totalCudaCores = (deviceProperty.multiProcessorCount*48);
+            printf("Total CUDA cores: %d \n", totalCudaCores);
+        }
+        else
+        {
+            printf("Total CUDA cores unknown, version 2.");
+            printf("%d was released after this software was written.\n", deviceProperty.minor);
+        }
+    }
+    else
+    {
+        printf("Total CUDA cores unknown, version %d.", deviceProperty.major);
+        printf("%d was released after this software was written.\n", deviceProperty.minor);
+    }
+
+    
+
+}
+
+// --------------------------------------------------------------------------------
+// Main function
+// --------------------------------------------------------------------------------
+
+
+void your_histogram_and_prefixsum(const float * const d_pArrLogLuminance,
+                                  unsigned int * const d_pArrCDF,
                                   float &pMin_logLum,
                                   float &pMax_logLum,
                                   const size_t pNumRows,
@@ -366,6 +611,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+    ShowDeviceProperty();
 
     // display picture info
     printf("pNumRows=%d\n", pNumRows);
@@ -374,30 +620,52 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     // dummy1<<<1, 1>>>(d_logLuminance);
 
     // Declarations
-    float vRange;
-    unsigned int * vHistogram;
-    int vCount;
+    unsigned int * vArrHistogram;
     
     // Calc the min and max value of d_logLuminance
-    CalcMinMax(d_logLuminance,
+    CalcMinMax(d_pArrLogLuminance,
                pNumRows,
                pNumCols,
                pMin_logLum,
                pMax_logLum);
 
     // Allocate memory for histogram
-    checkCudaErrors(cudaMalloc(&vHistogram, sizeof(unsigned int) * pNumBins));
+    checkCudaErrors(cudaMalloc(&vArrHistogram, sizeof(unsigned int) * pNumBins));
 
-    // Generate histogram
-    CalcHistogram(d_logLuminance,
-                  pNumRows,
-                  pNumCols,
-                  pNumBins,
-                  pMin_logLum,
-                  pMax_logLum,
-                  vHistogram);
+    // Generate histogram    
+    /*
+    CalcHistogramOld(d_pArrLogLuminance,
+                     pNumRows,
+                     pNumCols,
+                     pNumBins,
+                     pMin_logLum,
+                     pMax_logLum,
+                     vArrHistogram);
+    */
+    /*
+    CalcHistogramReduce(d_pArrLogLuminance,
+                        pNumRows,
+                        pNumCols,
+                        pNumBins,
+                        pMin_logLum,
+                        pMax_logLum,
+                        vArrHistogram);
+    */
+    
+    CalcHistogramNew(d_pArrLogLuminance,
+                     pNumRows,
+                     pNumCols,
+                     pNumBins,
+                     pMin_logLum,
+                     pMax_logLum,
+                     vArrHistogram);
+    
+    // Calculate the CDF
+    CalcCDF(vArrHistogram,
+            pNumBins,
+            d_pArrCDF);
 
     // Free memory for histogram
-    checkCudaErrors(cudaFree(vHistogram));
+    checkCudaErrors(cudaFree(vArrHistogram));
 
 }
