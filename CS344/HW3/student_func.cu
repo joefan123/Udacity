@@ -287,33 +287,48 @@ void global_CalcHistNew_kernel(const float * const d_pArrLogLuminance,
                                   float const pMax_logLum,
                                   unsigned int * pArrHistogram)
 {
-
     // Declarations
     int vBinID;
     float vRange;
-    int vIdxRow;
-    int vIdxCol;
     int vIdxPixel;
+    int vOffset;
 
-    // Initialize pixel location
-    vIdxCol = (blockIdx.x * blockDim.x) + threadIdx.x;
-    vIdxRow = (blockIdx.y * blockDim.y) + threadIdx.y;
-    vIdxPixel = vIdxRow * pNumCols + vIdxCol;
+    // Allocate memory for thread block's histogram
+    extern __shared__ unsigned int sh_vArrHistogram[];
 
-    // Check image bounds before accessing GPU memory
-    if ( vIdxCol >= pNumCols || vIdxRow >= pNumRows )
-        return;
+    // Initialize thread block's histogram
+    vBinID = threadIdx.x;  
+    sh_vArrHistogram[vBinID] = 0;
 
-    // Identify bins
-    vRange = pMax_logLum - pMin_logLum;
-    vBinID = min(static_cast<unsigned int>(pNumBins - 1),
-                 static_cast<unsigned int>((d_pArrLogLuminance[vIdxPixel] - pMin_logLum) / vRange * pNumBins));
+    __syncthreads();    // ensure that initialization is complete
 
-    // Debug output
-    // printf("vIdxCol = %d, vIdxRow = %d, vIdxPixel = %d, vBinID = %d\n", vIdxCol, vIdxRow, vIdxPixel, vBinID);
+    // Initialize pixel ID and offset
+    vIdxPixel = (blockIdx.x * blockDim.x) + threadIdx.x;
+    vOffset = blockDim.x * gridDim.x;
 
-    // Increment histogram
-    atomicAdd(&(pArrHistogram[vBinID]), 1);
+    // In each block, create a local histogram that has #bins threads. 
+    // In each thread, traverse vArrLogLuminance in parallel across each local histogram and update local histograms
+    while (vIdxPixel < (pNumRows * pNumCols))
+    {
+
+        // Identify bins
+        vRange = pMax_logLum - pMin_logLum;
+        vBinID = min(static_cast<unsigned int>(pNumBins - 1),
+                     static_cast<unsigned int>((d_pArrLogLuminance[vIdxPixel] - pMin_logLum) / vRange * pNumBins));
+
+        // Increment thread block's histogram
+        atomicAdd(&sh_vArrHistogram[vBinID], 1);
+
+        // Increment pixel ID
+        vIdxPixel += vOffset;
+
+    }
+
+    __syncthreads();    // ensure that all thread block histograms are complete
+
+    // Consolidate all thread block histograms into final histogram
+    vBinID = threadIdx.x;
+    atomicAdd(&pArrHistogram[vBinID], sh_vArrHistogram[vBinID]);
 
 }
 
@@ -475,15 +490,11 @@ void CalcHistogramNew(const float * const d_pArrLogLuminance,
                          float const pMax_logLum,
                          unsigned int * pArrHistogram)
 {
-    printf("Work in progress\n");
-    /*
+   
     // Initalization
-    // const dim3 vBlockSize(16, 16, 1);
-    const dim3 vBlockSize(32, 32, 1);
-
-    const dim3 vGridSize(ceil(static_cast<float>(pNumCols) / vBlockSize.x), 
-                         ceil(static_cast<float>(pNumRows) / vBlockSize.y),
-                         1);
+    const int vStride = pNumBins;
+    const int vBlockSize = vStride;
+    const int vGridSize = vBlockSize * 8;
 
     // Initialize histogram
     global_InitHist_kernel<<<1, pNumBins>>>
@@ -491,9 +502,9 @@ void CalcHistogramNew(const float * const d_pArrLogLuminance,
 
     cudaDeviceSynchronize();
     checkCudaErrors(cudaGetLastError());
-    
+
     // Generate histogram
-    global_CalcHistNew_kernel<<<vGridSize, vBlockSize>>>
+    global_CalcHistNew_kernel<<<vGridSize, vBlockSize, pNumBins * sizeof(unsigned int)>>>
         (d_pArrLogLuminance,
          pNumRows,
          pNumCols,
@@ -508,7 +519,7 @@ void CalcHistogramNew(const float * const d_pArrLogLuminance,
     // debug
     dummy3<<<1, 1>>>(pArrHistogram);
     checkCudaErrors(cudaGetLastError());
-    */
+    
 }
 
 
